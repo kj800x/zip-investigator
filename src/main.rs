@@ -1,5 +1,6 @@
 use clap::Parser;
-use humansize::{format_size, DECIMAL};
+use indicatif::{HumanBytes, ProgressBar};
+use itertools::Itertools;
 use std::{
     ffi::OsStr,
     fs::File,
@@ -51,13 +52,27 @@ fn investigate(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut total_compressed: u64 = 0;
     let mut total_savings: u64 = 0;
 
-    for entry in WalkDir::new(root) {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension() != Some(OsStr::new("zip")) {
-            continue;
-        }
+    println!("Discovering zip files...");
+    let spinner = ProgressBar::new_spinner();
+    let zips = WalkDir::new(root)
+        .into_iter()
+        .filter_map(|x| -> Option<walkdir::DirEntry> {
+            spinner.tick();
+            let path = x.as_ref().ok()?.path();
+            if path.extension() == Some(OsStr::new("zip")) {
+                Some(x.unwrap())
+            } else {
+                None
+            }
+        })
+        .collect_vec();
 
+    spinner.finish_and_clear();
+    let bar = ProgressBar::new(zips.len() as u64);
+
+    for entry in zips {
+        bar.inc(1);
+        let path = entry.path();
         match investigate_zip(path) {
             Ok(InvestigateOk {
                 extracted_size,
@@ -67,43 +82,45 @@ fn investigate(root: &str) -> Result<(), Box<dyn std::error::Error>> {
                 total_compressed += compressed_size;
                 total_savings += extracted_size - compressed_size;
 
-                println!();
-                println!("File: {}", path.as_os_str().to_str().unwrap());
-                println!("Extracted size : {}", format_size(extracted_size, DECIMAL),);
-                println!(
+                bar.println("");
+                bar.println(format!("File: {}", path.as_os_str().to_str().unwrap()));
+                bar.println(format!("Extracted size : {}", HumanBytes(extracted_size)));
+                bar.println(format!(
                     "Compressed size: {} ({:.2}%)",
-                    format_size(compressed_size, DECIMAL),
+                    HumanBytes(compressed_size),
                     (compressed_size as f64 / extracted_size as f64) * 100.0
-                );
-                println!(
+                ));
+                bar.println(format!(
                     "Savings        : {}",
-                    format_size(extracted_size - compressed_size, DECIMAL)
-                );
+                    HumanBytes(extracted_size - compressed_size)
+                ));
             }
             Err(e) => {
-                println!();
-                println!("File: {}", path.as_os_str().to_str().unwrap());
-                println!("Error: {}", e);
+                bar.println(format!(""));
+                bar.println(format!("File: {}", path.as_os_str().to_str().unwrap()));
+                bar.println(format!("Error: {}", e));
             }
         }
     }
+
+    bar.finish_and_clear();
 
     println!();
     println!(
         "Total extracted size : {} ({})",
         total_extracted,
-        format_size(total_extracted, DECIMAL)
+        HumanBytes(total_extracted)
     );
     println!(
         "Total compressed size: {} ({}) - ({:.2}%)",
         total_compressed,
-        format_size(total_compressed, DECIMAL),
+        HumanBytes(total_compressed),
         (total_compressed as f64 / total_extracted as f64) * 100.0
     );
     println!(
         "Total savings        : {} ({})",
         total_savings,
-        format_size(total_savings, DECIMAL)
+        HumanBytes(total_savings)
     );
 
     Ok(())
