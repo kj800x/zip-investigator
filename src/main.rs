@@ -1,7 +1,13 @@
 use clap::Parser;
 use humansize::{format_size, DECIMAL};
-use std::{ffi::OsStr, path::Path};
+use std::{
+    ffi::OsStr,
+    fs::File,
+    io::{Error, ErrorKind, Read},
+    path::Path,
+};
 use walkdir::WalkDir;
+use zip::ZipArchive;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -25,8 +31,8 @@ struct InvestigateOk {
 }
 
 fn investigate_zip(path: &Path) -> Result<InvestigateOk, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
+    let file = File::open(path)?;
+    let mut archive = ZipArchive::new(file)?;
     let mut extracted_size: u64 = 0;
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
@@ -104,8 +110,8 @@ fn investigate(root: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn extract_zip(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
+    let file = File::open(path)?;
+    let mut archive = ZipArchive::new(file)?;
 
     // extract the zip into a directory with the same name (without the .zip extension)
     let directory = path.with_extension("");
@@ -152,6 +158,133 @@ fn extract(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn verify_zip(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut archive = ZipArchive::new(File::open(path)?)?;
+    let directory = path.with_extension("");
+
+    for i in 0..archive.len() {
+        let mut expected_file = archive.by_index(i)?;
+
+        if expected_file.is_dir() {
+            continue;
+        }
+
+        let expected_file_name = expected_file.enclosed_name().ok_or(Error::new(
+            ErrorKind::Other,
+            "Could not call enclosed_name on file in zip archive",
+        ))?;
+        let actual_file_path = directory.join(expected_file_name);
+        let mut expected_contents = Vec::new();
+        let mut actual_contents = Vec::new();
+
+        if !actual_file_path.exists() {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("File not found: {}", actual_file_path.display()),
+            )
+            .into());
+        }
+
+        let actual_size = actual_file_path.metadata()?.len();
+
+        if expected_file.size() != actual_size {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "File size mismatch: {} (expected: {}, actual: {})",
+                    actual_file_path.display(),
+                    expected_file.size(),
+                    actual_file_path.metadata()?.len()
+                ),
+            )
+            .into());
+        }
+
+        let mut actual_file = File::open(actual_file_path.clone())?;
+
+        expected_file.read_to_end(&mut expected_contents)?;
+        actual_file.read_to_end(&mut actual_contents)?;
+
+        if expected_contents != actual_contents {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("File contents mismatch: {}", actual_file_path.display()),
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn verify(root: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ok_count = 0;
+    let mut err_count = 0;
+
+    for entry in WalkDir::new(root) {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("zip")) {
+            continue;
+        }
+
+        match verify_zip(path) {
+            Ok(()) => {
+                println!("OK   : {}", path.as_os_str().to_str().unwrap());
+                ok_count += 1;
+            }
+            Err(e) => {
+                println!("ERR  : {}", path.as_os_str().to_str().unwrap());
+                println!("Error: {}", e);
+                err_count += 1;
+            }
+        }
+    }
+
+    println!();
+    println!("OK  count: {}", ok_count);
+    println!("ERR count: {}", err_count);
+
+    Ok(())
+}
+
+fn delete_zip(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    verify_zip(path)?;
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+fn delete(root: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ok_count = 0;
+    let mut err_count = 0;
+
+    for entry in WalkDir::new(root) {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("zip")) {
+            continue;
+        }
+
+        match delete_zip(path) {
+            Ok(()) => {
+                println!("OK   : {}", path.as_os_str().to_str().unwrap());
+                ok_count += 1;
+            }
+            Err(e) => {
+                println!("ERR  : {}", path.as_os_str().to_str().unwrap());
+                println!("Error: {}", e);
+                err_count += 1;
+            }
+        }
+    }
+
+    println!();
+    println!("OK  count: {}", ok_count);
+    println!("ERR count: {}", err_count);
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -163,10 +296,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             extract(root)?;
         }
         Commands::Verify { root } => {
-            println!("Verify todo, root: {}", root);
+            verify(root)?;
         }
         Commands::Delete { root } => {
-            println!("Delete todo, root: {}", root);
+            delete(root)?;
         }
     }
 
