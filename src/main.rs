@@ -1,5 +1,5 @@
 use clap::Parser;
-use indicatif::{HumanBytes, ProgressBar};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar};
 use itertools::Itertools;
 use std::{
     ffi::OsStr,
@@ -51,27 +51,10 @@ fn investigate(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut total_extracted: u64 = 0;
     let mut total_compressed: u64 = 0;
     let mut total_savings: u64 = 0;
-
-    println!("Discovering zip files...");
-    let spinner = ProgressBar::new_spinner();
-    let zips = WalkDir::new(root)
-        .into_iter()
-        .filter_map(|x| -> Option<walkdir::DirEntry> {
-            spinner.tick();
-            let path = x.as_ref().ok()?.path();
-            if path.extension() == Some(OsStr::new("zip")) {
-                Some(x.unwrap())
-            } else {
-                None
-            }
-        })
-        .collect_vec();
-
-    spinner.finish_and_clear();
+    let zips = discover_zips(root);
     let bar = ProgressBar::new(zips.len() as u64);
 
     for entry in zips {
-        bar.inc(1);
         let path = entry.path();
         match investigate_zip(path) {
             Ok(InvestigateOk {
@@ -101,6 +84,7 @@ fn investigate(root: &str) -> Result<(), Box<dyn std::error::Error>> {
                 bar.println(format!("Error: {}", e));
             }
         }
+        bar.inc(1);
     }
 
     bar.finish_and_clear();
@@ -126,17 +110,37 @@ fn investigate(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn extract_zip(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn discover_zips(root: &str) -> Vec<walkdir::DirEntry> {
+    println!("Discovering zip files...");
+    let spinner = ProgressBar::new_spinner();
+    let zips = WalkDir::new(root)
+        .into_iter()
+        .filter_map(|x| -> Option<walkdir::DirEntry> {
+            spinner.tick();
+            let path = x.as_ref().ok()?.path();
+            if path.extension() == Some(OsStr::new("zip")) {
+                Some(x.unwrap())
+            } else {
+                None
+            }
+        })
+        .collect_vec();
+    spinner.finish_and_clear();
+
+    zips
+}
+
+fn extract_zip(path: &Path, bar: &ProgressBar) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
 
     // extract the zip into a directory with the same name (without the .zip extension)
     let directory = path.with_extension("");
     if directory.exists() {
-        println!(
+        bar.println(format!(
             "WARN : Directory already exists, overwriting: {}",
             directory.display()
-        );
+        ));
     }
     std::fs::create_dir_all(&directory)?;
 
@@ -148,25 +152,25 @@ fn extract_zip(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn extract(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut ok_count = 0;
     let mut err_count = 0;
-    for entry in WalkDir::new(root) {
-        let entry = entry?;
+    let zips = discover_zips(root);
+    println!("Extracting discovered zip files...");
+    let bar = ProgressBar::new(zips.len() as u64);
+    for entry in zips {
         let path = entry.path();
-        if path.extension() != Some(OsStr::new("zip")) {
-            continue;
-        }
-
-        match extract_zip(path) {
+        match extract_zip(path, &bar) {
             Ok(()) => {
-                println!("OK   : {}", path.as_os_str().to_str().unwrap());
+                bar.println(format!("OK   : {}", path.as_os_str().to_str().unwrap()));
                 ok_count += 1;
             }
             Err(e) => {
-                println!("ERR  : {}", path.as_os_str().to_str().unwrap());
-                println!("Error: {}", e);
+                bar.println(format!("ERR  : {}", path.as_os_str().to_str().unwrap()));
+                bar.println(format!("Error: {}", e));
                 err_count += 1;
             }
         }
+        bar.inc(1);
     }
+    bar.finish_and_clear();
 
     println!();
     println!("OK  count: {}", ok_count);
@@ -175,11 +179,16 @@ fn extract(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn verify_zip(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_zip(
+    path: &Path,
+    bar_container: &MultiProgress,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut archive = ZipArchive::new(File::open(path)?)?;
     let directory = path.with_extension("");
 
+    let inner_bar = bar_container.add(ProgressBar::new(archive.len() as u64));
     for i in 0..archive.len() {
+        inner_bar.inc(1);
         let mut expected_file = archive.by_index(i)?;
 
         if expected_file.is_dir() {
@@ -231,6 +240,9 @@ fn verify_zip(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    inner_bar.finish_and_clear();
+    bar_container.remove(&inner_bar);
+
     Ok(())
 }
 
@@ -238,25 +250,28 @@ fn verify(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut ok_count = 0;
     let mut err_count = 0;
 
-    for entry in WalkDir::new(root) {
-        let entry = entry?;
+    let zips = discover_zips(root);
+    println!("Verifying zip files were extracted correctly...");
+    let bar_container = MultiProgress::new();
+    let bar = bar_container.add(ProgressBar::new(zips.len() as u64));
+    bar.tick();
+    for entry in zips {
         let path = entry.path();
-        if path.extension() != Some(OsStr::new("zip")) {
-            continue;
-        }
-
-        match verify_zip(path) {
+        match verify_zip(path, &bar_container) {
             Ok(()) => {
-                println!("OK   : {}", path.as_os_str().to_str().unwrap());
+                bar_container.println(format!("OK   : {}", path.as_os_str().to_str().unwrap()))?;
                 ok_count += 1;
             }
             Err(e) => {
-                println!("ERR  : {}", path.as_os_str().to_str().unwrap());
-                println!("Error: {}", e);
+                bar_container.println(format!("ERR  : {}", path.as_os_str().to_str().unwrap()))?;
+                bar_container.println(format!("Error: {}", e))?;
                 err_count += 1;
             }
         }
+        bar.inc(1);
     }
+    bar.finish_and_clear();
+    bar_container.clear()?;
 
     println!();
     println!("OK  count: {}", ok_count);
@@ -265,8 +280,11 @@ fn verify(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn delete_zip(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    verify_zip(path)?;
+fn delete_zip(
+    path: &Path,
+    bar_container: &MultiProgress,
+) -> Result<(), Box<dyn std::error::Error>> {
+    verify_zip(path, bar_container)?;
     std::fs::remove_file(path)?;
     Ok(())
 }
@@ -275,25 +293,29 @@ fn delete(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut ok_count = 0;
     let mut err_count = 0;
 
-    for entry in WalkDir::new(root) {
-        let entry = entry?;
+    let zips = discover_zips(root);
+    println!("Deleting zip files that are already extracted...");
+    let bar_container = MultiProgress::new();
+    let bar = bar_container.add(ProgressBar::new(zips.len() as u64));
+    bar.tick();
+    for entry in zips {
         let path = entry.path();
-        if path.extension() != Some(OsStr::new("zip")) {
-            continue;
-        }
-
-        match delete_zip(path) {
+        match delete_zip(path, &bar_container) {
             Ok(()) => {
-                println!("OK   : {}", path.as_os_str().to_str().unwrap());
+                bar.println(format!("OK   : {}", path.as_os_str().to_str().unwrap()));
                 ok_count += 1;
             }
             Err(e) => {
-                println!("ERR  : {}", path.as_os_str().to_str().unwrap());
-                println!("Error: {}", e);
+                bar.println(format!("ERR  : {}", path.as_os_str().to_str().unwrap()));
+                bar.println(format!("Error: {}", e));
                 err_count += 1;
             }
         }
+        bar.inc(1);
     }
+    bar.finish_and_clear();
+    bar_container.remove(&bar);
+    bar_container.clear()?;
 
     println!();
     println!("OK  count: {}", ok_count);
